@@ -19,6 +19,7 @@
     "browserslist": "> 0.25%, not dead",
     "devDependencies": {
         "@types/node": "^22.1.0",
+        "@types/ws": "^8.5.12",
         "del": "^7.1.0",
         "gulp": "^5.0.0",
         "gulp-ext-replace": "^0.3.0",
@@ -38,5 +39,8 @@
         "build": "gulp",
         "dist": "gulp dist",
         "clean": "gulp clean"
+    },
+    "dependencies": {
+        "ws": "^8.18.0"
     }
 }

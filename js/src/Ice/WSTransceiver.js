@@ -8,6 +8,7 @@ import { ConnectionInfo as SSLConnectionInfo } from "./SSL/ConnectionInfo.js";
 import { SocketOperation } from "./SocketOperation.js";
 import { Timer } from "./Timer.js";
 import { Debug } from "./Debug.js";
+import { WebSocket as WebSocketNode } from 'ws';
 
 export let WSTransceiver = {};
 
@@ -334,5 +335,268 @@ if (typeof WebSocket !== "undefined") {
         }
     }
 } else {
-    WSTransceiver = class {};
+    WSTransceiver = class {
+        constructor(instance) {
+            this._readBuffers = [];
+            this._readPosition = 0;
+            this._maxSendPacketSize = instance.properties().getPropertyAsIntWithDefault("Ice.TCP.SndSize", 512 * 1024);
+            this._writeReadyTimeout = 0;
+        }
+
+        writeReadyTimeout() {
+            const t = Math.round(this._writeReadyTimeout);
+            this._writeReadyTimeout += this._writeReadyTimeout >= 5 ? 5 : 0.2;
+            return Math.min(t, 25);
+        }
+
+        setCallbacks(connectedCallback, bytesAvailableCallback, bytesWrittenCallback) {
+            this._connectedCallback = connectedCallback;
+            this._bytesAvailableCallback = bytesAvailableCallback;
+            this._bytesWrittenCallback = bytesWrittenCallback;
+        }
+
+        //
+        // Returns SocketOperation.None when initialization is complete.
+        //
+        initialize(readBuffer, writeBuffer) {
+            try {
+                if (this._exception) {
+                    throw this._exception;
+                }
+
+                if (this._state === StateNeedConnect) {
+                    this._state = StateConnectPending;
+                    this._fd = new WebSocketNode(this._url, "ice.zeroc.com");
+                    this._fd.binaryType = "arraybuffer";
+                    this._fd.onopen = e => this.socketConnected(e);
+                    this._fd.onmessage = e => this.socketBytesAvailable(e.data);
+                    this._fd.onclose = e => this.socketClosed(e);
+                    return SocketOperation.Connect; // Waiting for connect to complete.
+                } else if (this._state === StateConnectPending) {
+                    //
+                    // Socket is connected.
+                    //
+                    this._desc = fdToString(this._addr);
+                    this._state = StateConnected;
+                }
+            } catch (err) {
+                if (!this._exception) {
+                    this._exception = translateError(this._state, err);
+                }
+                throw this._exception;
+            }
+
+            Debug.assert(this._state === StateConnected);
+            return SocketOperation.None;
+        }
+
+        register() {
+            //
+            // Register the socket data listener.
+            //
+            this._registered = true;
+            if (this._hasBytesAvailable || this._exception) {
+                this._hasBytesAvailable = false;
+                Timer.setTimeout(() => this._bytesAvailableCallback(), 0);
+            }
+        }
+
+        unregister() {
+            //
+            // Unregister the socket data listener.
+            //
+            this._registered = false;
+        }
+
+        close() {
+            if (this._fd === null) {
+                Debug.assert(this._exception); // Websocket creation failed.
+                return;
+            }
+
+            Debug.assert(this._fd !== null);
+            try {
+                this._state = StateClosed;
+                this._fd.close();
+            } catch (ex) {
+                throw translateError(this._state, ex);
+            } finally {
+                this._fd = null;
+            }
+        }
+
+        //
+        // Returns true if all of the data was flushed to the kernel buffer.
+        //
+        write(byteBuffer) {
+            if (this._exception) {
+                throw this._exception;
+            } else if (byteBuffer.remaining === 0) {
+                return true;
+            }
+            Debug.assert(this._fd);
+
+            const cb = () => {
+                if (this._fd) {
+                    const packetSize =
+                        this._maxSendPacketSize > 0 && byteBuffer.remaining > this._maxSendPacketSize
+                            ? this._maxSendPacketSize
+                            : byteBuffer.remaining;
+                    if (this._fd.bufferedAmount + packetSize <= this._maxSendPacketSize) {
+                        this._bytesWrittenCallback(0, 0);
+                    } else {
+                        Timer.setTimeout(cb, this.writeReadyTimeout());
+                    }
+                }
+            };
+
+            while (true) {
+                const packetSize =
+                    this._maxSendPacketSize > 0 && byteBuffer.remaining > this._maxSendPacketSize
+                        ? this._maxSendPacketSize
+                        : byteBuffer.remaining;
+                if (byteBuffer.remaining === 0) {
+                    break;
+                }
+                Debug.assert(packetSize > 0);
+                if (this._fd.bufferedAmount + packetSize > this._maxSendPacketSize) {
+                    Timer.setTimeout(cb, this.writeReadyTimeout());
+                    return false;
+                }
+                this._writeReadyTimeout = 0;
+                const slice = byteBuffer.b.slice(byteBuffer.position, byteBuffer.position + packetSize);
+                this._fd.send(slice);
+                byteBuffer.position += packetSize;
+
+                //
+                // TODO: WORKAROUND for Safari issue. The websocket accepts all the
+                // data (bufferedAmount is always 0). We relinquish the control here
+                // to ensure timeouts work properly.
+                //
+                if (IsSafari && byteBuffer.remaining > 0) {
+                    Timer.setTimeout(cb, this.writeReadyTimeout());
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        read(byteBuffer, moreData) {
+            if (this._exception) {
+                throw this._exception;
+            }
+
+            moreData.value = false;
+
+            if (this._readBuffers.length === 0) {
+                return false; // No data available.
+            }
+
+            let avail = this._readBuffers[0].byteLength - this._readPosition;
+            Debug.assert(avail > 0);
+
+            while (byteBuffer.remaining > 0) {
+                if (avail > byteBuffer.remaining) {
+                    avail = byteBuffer.remaining;
+                }
+
+                new Uint8Array(byteBuffer.b).set(
+                    new Uint8Array(this._readBuffers[0], this._readPosition, avail),
+                    byteBuffer.position,
+                );
+
+                byteBuffer.position += avail;
+                this._readPosition += avail;
+                if (this._readPosition === this._readBuffers[0].byteLength) {
+                    //
+                    // We've exhausted the current read buffer.
+                    //
+                    this._readPosition = 0;
+                    this._readBuffers.shift();
+                    if (this._readBuffers.length === 0) {
+                        break; // No more data - we're done.
+                    } else {
+                        avail = this._readBuffers[0].byteLength;
+                    }
+                }
+            }
+
+            moreData.value = this._readBuffers.length > 0;
+
+            return byteBuffer.remaining === 0;
+        }
+
+        type() {
+            return this._secure ? "wss" : "ws";
+        }
+
+        getInfo() {
+            Debug.assert(this._fd !== null);
+            const info = new WSConnectionInfo();
+            const tcpInfo = new TCPConnectionInfo();
+            tcpInfo.localAddress = "";
+            tcpInfo.localPort = -1;
+            tcpInfo.remoteAddress = this._addr.host;
+            tcpInfo.remotePort = this._addr.port;
+            info.underlying = this._secure
+                ? new SSLConnectionInfo(tcpInfo, tcpInfo.timeout, tcpInfo.compress)
+                : tcpInfo;
+            tcpInfo.rcvSize = -1;
+            tcpInfo.sndSize = this._maxSendPacketSize;
+            info.headers = {};
+            return info;
+        }
+
+        setBufferSize(rcvSize, sndSize) {
+            this._maxSendPacketSize = sndSize;
+        }
+
+        toString() {
+            return this._desc;
+        }
+
+        socketConnected(e) {
+            Debug.assert(this._connectedCallback !== null);
+            this._connectedCallback();
+        }
+
+        socketBytesAvailable(buf) {
+            Debug.assert(this._bytesAvailableCallback !== null);
+            if (buf.byteLength > 0) {
+                this._readBuffers.push(buf);
+                if (this._registered) {
+                    this._bytesAvailableCallback();
+                } else if (!this._hasBytesAvailable) {
+                    this._hasBytesAvailable = true;
+                }
+            }
+        }
+
+        socketClosed(err) {
+            this._exception = translateError(this._state, err);
+            if (this._state < StateConnected) {
+                this._connectedCallback();
+            } else if (this._registered) {
+                this._bytesAvailableCallback();
+            }
+        }
+
+        static createOutgoing(instance, secure, addr, resource) {
+            const transceiver = new WSTransceiver(instance);
+            let url = secure ? "wss" : "ws";
+            url += "://" + addr.host;
+            if (addr.port !== 80) {
+                url += ":" + addr.port;
+            }
+            url += resource ? resource : "/";
+            transceiver._url = url;
+            transceiver._fd = null;
+            transceiver._addr = addr;
+            transceiver._desc = "local address = <not available>\nremote address = " + addr.host + ":" + addr.port;
+            transceiver._state = StateNeedConnect;
+            transceiver._secure = secure;
+            transceiver._exception = null;
+            return transceiver;
+        }
+    };
 }
